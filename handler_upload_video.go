@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -68,9 +72,6 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	defer os.Remove("tubely-upload.mp4")
-	defer temp.Close()
-
 	if _, err := io.Copy(temp, video); err != nil {
 		respondWithError(w, http.StatusInternalServerError, "error copying video", err)
 		return
@@ -81,14 +82,38 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	orientation, err := getVideoAspectRatio(temp.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "error running ffmpeg", err)
+	}
+
+	processedVideo, err := processVideoForFastStart(temp.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "error processing video", err)
+		return
+	}
+
+	processedFile, err := os.Open(processedVideo)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "error opening processed file", err)
+		return
+	}
+
+	defer os.Remove(processedVideo)
+	defer processedFile.Close()
+
+	defer os.Remove("tubely-upload.mp4")
+	defer temp.Close()
+
 	key := make([]byte, 32)
 	rand.Read(key)
-	keySTR := base64.RawURLEncoding.EncodeToString(key)
+	log.Printf("orientation: %s", orientation)
+	keySTR := fmt.Sprintf("/%s/", orientation) + base64.RawURLEncoding.EncodeToString(key)
 
 	_, err = cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
 		Bucket:      aws.String(cfg.s3Bucket),
 		Key:         aws.String(keySTR),
-		Body:        temp,
+		Body:        processedFile,
 		ContentType: aws.String("video/mp4"),
 	})
 	if err != nil {
@@ -100,4 +125,69 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 
 	videoMetaData.VideoURL = &videoURl
 	cfg.db.UpdateVideo(videoMetaData)
+}
+
+func getVideoAspectRatio(filePath string) (string, error) {
+
+	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
+
+	var videoBytes bytes.Buffer
+	var errorBytes bytes.Buffer
+	cmd.Stdout = &videoBytes
+	cmd.Stderr = &errorBytes
+	err := cmd.Run()
+	log.Printf("command finished with error: %v", errorBytes.String())
+
+	type streams struct {
+		Heigth int `json:"height"`
+		Width  int `json:"width"`
+	}
+
+	type videoJSON struct {
+		Streams []streams `json:"streams"`
+	}
+	var videoJson videoJSON
+
+	err = json.Unmarshal(videoBytes.Bytes(), &videoJson)
+	if err != nil {
+		return "", fmt.Errorf("error unmarshaling ffprobe json: %s", err)
+
+	}
+	var aspectRatio float64
+	for _, thing := range videoJson.Streams {
+		aspectRatio = float64(thing.Width) / float64(thing.Heigth)
+		log.Printf("width: %d, height: %d, aspectRatio: %f", thing.Width, thing.Heigth, aspectRatio)
+		break
+	}
+
+	var orientation string
+	if aspectRatio >= 1.6 && aspectRatio <= 1.8 {
+		orientation = "landscape"
+		if orientation == "" {
+			return "", fmt.Errorf("error orientation is empty")
+		}
+	} else if aspectRatio >= 0.4 && aspectRatio <= 0.6 {
+		orientation = "portrait"
+		if orientation == "" {
+			return "", fmt.Errorf("error orientation is empty")
+		}
+	} else {
+		orientation = "other"
+	}
+
+	return orientation, nil
+
+}
+
+func processVideoForFastStart(filePath string) (string, error) {
+	outputFilePath := filePath + ".processing"
+
+	cmd := exec.Command("ffmpeg", "-i", filePath, "-c", "copy", "-movflags", "faststart", "-f", "mp4", outputFilePath)
+
+	err := cmd.Run()
+	if err != nil {
+		return "", fmt.Errorf("error running command ")
+	}
+
+	return outputFilePath, nil
 }
